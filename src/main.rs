@@ -28,6 +28,10 @@ fn main() {
     if let Some(Command::RemoteAgent(command)) = opts.command.clone() {
         #[cfg(unix)]
         {
+            // A remote-pty subprocess owns a terminal pane. Human-readable
+            // bridge diagnostics must travel through its health sidecar/UI,
+            // never stderr, which is the same PTY stream as the remote app.
+            let is_terminal_bridge = matches!(&command, RemoteAgentCommand::RemotePty { .. });
             let result = match command {
                 RemoteAgentCommand::Serve { socket, foreground } => {
                     remote_agent::serve(socket, foreground)
@@ -78,7 +82,9 @@ fn main() {
                 } => remote_agent::report_state(&pane_id, &state, &agent, agent_pid, None),
             };
             if let Err(error) = result {
-                eprintln!("flock remote-agent: {error:#}");
+                if !is_terminal_bridge {
+                    eprintln!("flock remote-agent: {error:#}");
+                }
                 std::process::exit(1);
             }
             return;

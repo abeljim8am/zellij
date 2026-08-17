@@ -336,6 +336,10 @@ pub enum Target {
 /// the priority used when a session's panes disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RemoteIssueKind {
+    /// A bridge-side warning that did not break the remote PTY itself.
+    Diagnostic,
+    /// A newly-created pane has not completed its first connection yet.
+    Connecting,
     /// A transport that keeps dropping. Informational — retrying is already
     /// happening and there is nothing for the user to decide.
     Reconnecting,
@@ -348,10 +352,15 @@ pub enum RemoteIssueKind {
 }
 
 impl RemoteIssueKind {
-    /// Whether the user can do something about this. Reconnecting resolves
-    /// itself or does not; offering a button for it would be a lie.
+    /// Whether the user can do something about this. Connection retries resolve
+    /// themselves or do not; offering a button for them would be a lie.
     pub fn is_actionable(&self) -> bool {
-        !matches!(self, RemoteIssueKind::Reconnecting)
+        !matches!(
+            self,
+            RemoteIssueKind::Connecting
+                | RemoteIssueKind::Reconnecting
+                | RemoteIssueKind::Diagnostic
+        )
     }
 }
 
@@ -366,6 +375,8 @@ pub struct RemoteIssue {
     pub pane_count: usize,
     /// Highest consecutive-failure count across the session's panes.
     pub retry_count: u32,
+    /// Most recent bounded diagnostic from the pane that raised this issue.
+    pub last_error: Option<String>,
 }
 
 /// How far an in-flight upgrade has got. Absent means the row is at rest.
@@ -397,6 +408,7 @@ pub fn session_remote_issue(session: &SessionInfo) -> Option<RemoteIssue> {
     let mut daemon_version = None;
     let mut local_version = None;
     let mut retry_count = 0;
+    let mut last_error = None;
     for pane in session.remote_panes.values() {
         let health = &pane.health;
         let pane_kind = match health.status {
@@ -406,8 +418,15 @@ pub fn session_remote_issue(session: &SessionInfo) -> Option<RemoteIssue> {
             RemoteProtocolStatus::InstallFailed => Some(RemoteIssueKind::InstallFailed),
             RemoteProtocolStatus::VersionSkew => Some(RemoteIssueKind::VersionSkew),
             // A healthy pane still reports a problem while it is retrying.
-            RemoteProtocolStatus::Ok if health.retry_count > 0 => {
-                Some(RemoteIssueKind::Reconnecting)
+            RemoteProtocolStatus::Ok if health.retry_count > 0 => Some(
+                if session.remote_connection_state == RemoteConnectionState::Connecting {
+                    RemoteIssueKind::Connecting
+                } else {
+                    RemoteIssueKind::Reconnecting
+                },
+            ),
+            RemoteProtocolStatus::Ok if health.last_error.is_some() => {
+                Some(RemoteIssueKind::Diagnostic)
             },
             RemoteProtocolStatus::Ok => None,
         };
@@ -418,6 +437,7 @@ pub fn session_remote_issue(session: &SessionInfo) -> Option<RemoteIssue> {
             if kind.is_none_or(|current| pane_kind > current) {
                 daemon_version = health.daemon_version.clone();
                 local_version = health.local_version.clone();
+                last_error = health.last_error.clone();
             }
             kind = Some(kind.map_or(pane_kind, |current| current.max(pane_kind)));
         }
@@ -429,6 +449,7 @@ pub fn session_remote_issue(session: &SessionInfo) -> Option<RemoteIssue> {
         local_version,
         pane_count: session.remote_panes.len(),
         retry_count,
+        last_error,
     })
 }
 
@@ -487,10 +508,15 @@ pub fn remote_issue_text(
             ("✗ reinstall needed  ⏎".to_owned(), IssueTone::Bad)
         },
         RemoteIssueKind::InstallFailed => ("✗ install failed  ⏎".to_owned(), IssueTone::Bad),
+        RemoteIssueKind::Connecting => (
+            format!("{spinner} connecting · try {}", issue.retry_count),
+            IssueTone::Busy,
+        ),
         RemoteIssueKind::Reconnecting => (
             format!("{spinner} reconnecting · try {}", issue.retry_count),
             IssueTone::Busy,
         ),
+        RemoteIssueKind::Diagnostic => ("⚠ remote diagnostic".to_owned(), IssueTone::Warn),
     }
 }
 
@@ -1345,7 +1371,10 @@ fn rail_issue_glyph(issue: &RemoteIssue, spinner_tick: u32) -> (&'static str, Is
         RemoteIssueKind::ProtocolIncompatible | RemoteIssueKind::InstallFailed => {
             ("✗", IssueTone::Bad)
         },
-        RemoteIssueKind::Reconnecting => (spinner_frame(spinner_tick), IssueTone::Busy),
+        RemoteIssueKind::Connecting | RemoteIssueKind::Reconnecting => {
+            (spinner_frame(spinner_tick), IssueTone::Busy)
+        },
+        RemoteIssueKind::Diagnostic => ("!", IssueTone::Warn),
     }
 }
 
@@ -1457,6 +1486,7 @@ mod tests {
             local_version: Some("26.7.0".into()),
             pane_count: 3,
             retry_count: 0,
+            last_error: None,
         }
     }
 
@@ -1526,6 +1556,8 @@ mod tests {
             .0,
         ];
         for kind in [
+            RemoteIssueKind::Connecting,
+            RemoteIssueKind::Diagnostic,
             RemoteIssueKind::ProtocolIncompatible,
             RemoteIssueKind::InstallFailed,
             RemoteIssueKind::Reconnecting,
@@ -1545,7 +1577,9 @@ mod tests {
 
     #[test]
     fn reconnecting_offers_no_action_but_every_fault_does() {
+        assert!(!RemoteIssueKind::Connecting.is_actionable());
         assert!(!RemoteIssueKind::Reconnecting.is_actionable());
+        assert!(!RemoteIssueKind::Diagnostic.is_actionable());
         assert!(RemoteIssueKind::VersionSkew.is_actionable());
         assert!(RemoteIssueKind::ProtocolIncompatible.is_actionable());
         assert!(RemoteIssueKind::InstallFailed.is_actionable());
@@ -1854,6 +1888,39 @@ mod tests {
         assert!(session_remote_issue(&session).is_none());
         let rows = build_rows(&PaneManifest::default(), &[], &BTreeMap::new(), &[session]);
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn an_initial_failure_is_connecting_not_reconnecting() {
+        let mut session = sess("api-dev", "/home/u/proj");
+        session.remote_connection_state = RemoteConnectionState::Connecting;
+        session.remote_panes.insert(
+            PaneId::Terminal(1),
+            zellij_tile::prelude::RemotePaneMetadata {
+                pane_uuid: "uuid".into(),
+                replay_cursor: 0,
+                close_pending: false,
+                foreground_argv: Vec::new(),
+                health: zellij_tile::prelude::RemotePaneHealth {
+                    retry_count: 1,
+                    last_error: Some("coder workspace is starting".into()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let issue = session_remote_issue(&session).expect("an issue");
+        assert_eq!(issue.kind, RemoteIssueKind::Connecting);
+        assert_eq!(
+            issue.last_error.as_deref(),
+            Some("coder workspace is starting")
+        );
+
+        session.remote_connection_state = RemoteConnectionState::Reconnecting;
+        assert_eq!(
+            session_remote_issue(&session).unwrap().kind,
+            RemoteIssueKind::Reconnecting
+        );
     }
 
     #[test]

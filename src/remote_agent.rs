@@ -1101,9 +1101,11 @@ pub fn remote_pty(
             stdin_router.forward(buffer[..count].to_vec());
         }
     });
-    // Stable IDs always attach first. An unknown-pane response creates it,
-    // making resurrection idempotent without duplicating shells.
-    let mut created = true;
+    // Only a serialized command carrying an explicit UUID is a resurrection.
+    // A new pane derives a stable UUID too, but must create first; treating that
+    // UUID as proof of prior existence makes first-connect failures look like
+    // reconnects and can attach a stale daemon pane after local id reuse.
+    let (mut attach_first, mut has_connected) = initial_connection_mode(requested_id.is_some());
     let cursor_path = local_cursor_path(pane_id)?;
     persist_connection(&cursor_path, "connecting")?;
     let mut cursor = fs::read_to_string(&cursor_path)
@@ -1119,7 +1121,7 @@ pub fn remote_pty(
         match run_remote_transport(
             &transport,
             pane_id,
-            created,
+            attach_first,
             cursor,
             &cursor_path,
             cwd.as_deref(),
@@ -1129,56 +1131,43 @@ pub fn remote_pty(
         ) {
             Ok(TransportEnd::Exited(status)) => {
                 persist_connection(&cursor_path, "disconnected")?;
-                if status != Some(0) {
-                    let detail = status
-                        .map(|status| format!(" with status {status}"))
-                        .unwrap_or_else(|| " without an exit status".to_owned());
-                    writeln!(
-                        io::stderr(),
-                        "\r\nflock: {} remote shell exited{detail}; press Enter to start a new remote shell or Ctrl-c to close the pane",
-                        transport.label(),
-                    )?;
-                }
                 std::process::exit(status.unwrap_or(1))
             },
-            Ok(TransportEnd::Attached(last_cursor)) => {
-                created = true;
+            Ok(TransportEnd::Disconnected { last_cursor, error }) => {
+                has_connected = true;
+                attach_first = true;
                 cursor = last_cursor;
-            },
-            Err(error) => {
-                // The retry picture belongs in the sidebar, where it persists;
-                // the pane still gets one line so a user watching the terminal
-                // is not left guessing during the first reconnect.
                 health.retry_count = health.retry_count.saturating_add(1);
                 health.last_error = Some(humanize_transport_error(&error));
                 persist_health(&cursor_path, &health);
-                writeln!(
-                    io::stderr(),
-                    "\r\nflock: {} connection lost ({error}); reconnecting…",
-                    transport.label(),
-                )?;
+            },
+            Err(error) => {
+                health.retry_count = health.retry_count.saturating_add(1);
+                health.last_error = Some(humanize_transport_error(&error));
+                persist_health(&cursor_path, &health);
                 // A stopped container can be revived locally; run the
                 // transport's recovery (idempotent `devcontainer up`) before
                 // retrying. Only fires on the failure path, so transient
                 // daemon reconnects never pay for it.
                 if let Some(mut recover) = transport.recover_command() {
-                    let recovered = recover
+                    let output = recover
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
-                        .stderr(Stdio::inherit())
-                        .status()
-                        .map(|status| status.success())
-                        .unwrap_or(false);
-                    if recovered {
-                        writeln!(
-                            io::stderr(),
-                            "\r\nflock: container is up; if reconnecting still fails, it may have been rebuilt — reopen it from the session picker to reinstall flock",
-                        )?;
+                        .stderr(Stdio::piped())
+                        .output();
+                    if let Ok(output) = output {
+                        if !output.status.success() {
+                            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                            if !detail.is_empty() {
+                                health.last_error = Some(detail);
+                                persist_health(&cursor_path, &health);
+                            }
+                        }
                     }
                 }
             },
         }
-        persist_connection(&cursor_path, "reconnecting")?;
+        persist_connection(&cursor_path, retry_connection_state(has_connected))?;
         thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_secs(5));
     }
@@ -1612,8 +1601,62 @@ fn exchange_close_frames(child: &mut std::process::Child, pane_id: Uuid) -> Resu
 }
 
 enum TransportEnd {
-    Attached(u64),
+    Disconnected {
+        last_cursor: u64,
+        error: anyhow::Error,
+    },
     Exited(Option<i32>),
+}
+
+fn initial_connection_mode(has_saved_pane_id: bool) -> (bool, bool) {
+    // A saved UUID means this command came from session serialization: attach
+    // first and describe failures as reconnects. A derived UUID belongs to a
+    // genuinely new local pane: create first and remain "connecting" until the
+    // daemon confirms it.
+    (has_saved_pane_id, has_saved_pane_id)
+}
+
+fn retry_connection_state(has_connected: bool) -> &'static str {
+    if has_connected {
+        "reconnecting"
+    } else {
+        "connecting"
+    }
+}
+
+const DIAGNOSTIC_TAIL_BYTES: usize = 16 * 1024;
+
+/// Drain provider stderr without ever wiring it to the pane's slave PTY. SSH,
+/// Coder and devcontainer can all emit diagnostics while stdout is carrying the
+/// framed protocol; inheriting stderr splices those words into a full-screen
+/// remote application and corrupts its rendered grid.
+fn capture_diagnostics(mut stderr: impl Read + Send + 'static) -> Arc<Mutex<VecDeque<u8>>> {
+    let captured = Arc::new(Mutex::new(VecDeque::with_capacity(DIAGNOSTIC_TAIL_BYTES)));
+    let writer = captured.clone();
+    thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        while let Ok(count) = stderr.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            let mut tail = writer.lock().unwrap();
+            tail.extend(&buffer[..count]);
+            while tail.len() > DIAGNOSTIC_TAIL_BYTES {
+                tail.pop_front();
+            }
+        }
+    });
+    captured
+}
+
+fn diagnostic_tail(captured: &Arc<Mutex<VecDeque<u8>>>) -> Option<String> {
+    let bytes: Vec<u8> = captured.lock().unwrap().iter().copied().collect();
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
 }
 
 fn remote_attach_requests(
@@ -1650,9 +1693,59 @@ fn run_remote_transport(
         .connect_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("start {} remote-agent transport", transport.label()))?;
+    let diagnostics = child.stderr.take().map(capture_diagnostics);
+    let result = run_remote_transport_io(
+        &mut child,
+        pane_id,
+        attach_first,
+        cursor,
+        cursor_path,
+        cwd,
+        input_router,
+        agent_state_tx,
+        health,
+    );
+    if result.is_err()
+        || matches!(
+            &result,
+            Ok(TransportEnd::Disconnected {
+                last_cursor: _,
+                error: _
+            })
+        )
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    match (result, diagnostics.as_ref().and_then(diagnostic_tail)) {
+        (Err(error), Some(diagnostic)) => {
+            Err(error.context(format!("{} transport: {diagnostic}", transport.label())))
+        },
+        (Ok(TransportEnd::Disconnected { last_cursor, error }), Some(diagnostic)) => {
+            Ok(TransportEnd::Disconnected {
+                last_cursor,
+                error: error.context(format!("{} transport: {diagnostic}", transport.label())),
+            })
+        },
+        (result, _) => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_remote_transport_io(
+    child: &mut std::process::Child,
+    pane_id: Uuid,
+    attach_first: bool,
+    cursor: u64,
+    cursor_path: &Path,
+    cwd: Option<&Path>,
+    input_router: Arc<InputRouter>,
+    agent_state_tx: Option<&mpsc::Sender<RemoteAgentStateEvent>>,
+    health: &mut RemotePaneHealth,
+) -> Result<TransportEnd> {
     let child_stdin: TransportWriter = Arc::new(Mutex::new(Box::new(
         child.stdin.take().context("open transport stdin")?,
     )));
@@ -1732,6 +1825,7 @@ fn run_remote_transport(
     // response to AttachPane, producing duplicate CreatePane requests and
     // permanently discarding the first keystrokes.
     let mut create_sent = !attach_first;
+    let mut attach_sent = attach_first;
     let mut last_cursor = cursor;
     let mut truncated_replay = None;
     loop {
@@ -1755,11 +1849,16 @@ fn run_remote_transport(
                     },
                 )?;
                 if let Some(first_available) = truncated_replay {
-                    write!(
-                        io::stdout().lock(),
-                        "\x1b[!p\x1b[2J\x1b[H\r\n[flock: detached output exceeded the replay buffer; skipped incomplete terminal history before sequence {first_available}]\r\n",
-                    )?;
+                    // Reset terminal state after skipping a byte stream that may
+                    // begin mid-control-sequence. The diagnostic belongs in
+                    // health/UI; never splice human-readable bridge text into
+                    // the remote application's PTY stream.
+                    write!(io::stdout().lock(), "\x1b[!p\x1b[2J\x1b[H",)?;
                     io::stdout().lock().flush()?;
+                    health.last_error = Some(format!(
+                        "detached output before sequence {first_available} was truncated"
+                    ));
+                    persist_health(cursor_path, health);
                 }
                 break;
             },
@@ -1801,6 +1900,19 @@ fn run_remote_transport(
                     },
                 )?;
                 create_sent = true;
+            },
+            // Creation is idempotent across an ambiguous transport failure: if
+            // the daemon created the pane but the acknowledgement was lost, a
+            // fresh bridge retries CreatePane and receives this response. Attach
+            // to that exact UUID rather than spawning a duplicate or retrying
+            // forever. This is deliberately not the normal new-pane path.
+            ServerMessage::Error { message }
+                if create_sent && !attach_sent && message.contains("already exists") =>
+            {
+                for request in remote_attach_requests(pane_id, cursor, cols, rows) {
+                    write_frame(&mut *child_stdin.lock().unwrap(), &request)?;
+                }
+                attach_sent = true;
             },
             ServerMessage::Error { message } => bail!("{message}"),
             ServerMessage::Exited { status, .. } => {
@@ -1878,7 +1990,10 @@ fn run_remote_transport(
             Ok(ServerMessage::ReplayTruncated {
                 first_available, ..
             }) => {
-                write!(io::stdout().lock(), "\x1b[!p\x1b[2J\x1b[H\r\n[flock: remote output before sequence {first_available} was truncated]\r\n")?;
+                health.last_error = Some(format!(
+                    "remote output before sequence {first_available} was truncated"
+                ));
+                persist_health(cursor_path, health);
             },
             Ok(ServerMessage::Exited { status, .. }) => {
                 resize_active.store(false, Ordering::Relaxed);
@@ -1906,10 +2021,10 @@ fn run_remote_transport(
             },
             Ok(ServerMessage::Error { message }) => bail!("{message}"),
             Ok(_) => {},
-            Err(_) => {
+            Err(error) => {
                 resize_active.store(false, Ordering::Relaxed);
                 let _ = child.kill();
-                return Ok(TransportEnd::Attached(last_cursor));
+                return Ok(TransportEnd::Disconnected { last_cursor, error });
             },
         }
     }
@@ -1988,6 +2103,19 @@ fn persist_health(cursor_path: &Path, health: &RemotePaneHealth) {
     }
 }
 
+fn persist_bridge_diagnostic(pane_id: Uuid, detail: String) {
+    let Ok(cursor_path) = local_cursor_path(pane_id) else {
+        return;
+    };
+    let health_path = cursor_path.with_extension("health");
+    let mut health = fs::read_to_string(health_path)
+        .ok()
+        .and_then(|encoded| serde_json::from_str::<RemotePaneHealth>(&encoded).ok())
+        .unwrap_or_default();
+    health.last_error = Some(detail);
+    persist_health(&cursor_path, &health);
+}
+
 /// Strip the noise off an `anyhow` chain so the sidebar can render the cause on
 /// one narrow row. Keeps the outermost message, which is the one written for a
 /// human.
@@ -2011,7 +2139,10 @@ fn start_local_agent_state_forwarder() -> Option<mpsc::Sender<RemoteAgentStateEv
     thread::spawn(move || {
         for event in rx {
             if let Err(error) = forward_agent_state_to_local_plugin(&executable, &pane_id, &event) {
-                eprintln!("flock: failed to forward remote agent state: {error:#}");
+                persist_bridge_diagnostic(
+                    event.pane_id,
+                    format!("failed to forward remote agent state: {error:#}"),
+                );
             }
         }
     });
@@ -2724,6 +2855,32 @@ mod tests {
                     after_sequence: 42,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn fresh_remote_panes_create_before_they_ever_reconnect() {
+        assert_eq!(initial_connection_mode(false), (false, false));
+        assert_eq!(retry_connection_state(false), "connecting");
+
+        assert_eq!(initial_connection_mode(true), (true, true));
+        assert_eq!(retry_connection_state(true), "reconnecting");
+    }
+
+    #[test]
+    fn provider_diagnostics_are_bounded_to_the_last_nonempty_line() {
+        let captured = capture_diagnostics(
+            b"warning that should not enter the pty\nfinal transport error\n".as_slice(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while diagnostic_tail(&captured).as_deref() != Some("final transport error")
+            && Instant::now() < deadline
+        {
+            thread::yield_now();
+        }
+        assert_eq!(
+            diagnostic_tail(&captured).as_deref(),
+            Some("final transport error")
         );
     }
 

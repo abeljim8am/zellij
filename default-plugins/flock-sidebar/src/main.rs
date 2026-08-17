@@ -50,7 +50,7 @@ use std::time::Instant;
 
 use detect::{detect_agent, identify_agent_from_command, identify_agent_from_screen, AgentState};
 use hook::{parse_hook_report, HookReport, Presence, HOOK_PIPE_NAME};
-use palette::Theme;
+use palette::{fg, Theme, BOLD, DIM, RESET};
 use sessionizer::SessionizerConfig;
 use state::PaneAgentState;
 use ui::{ClickTarget, SidebarMode, Target};
@@ -77,6 +77,12 @@ const SESSION_REFRESH_SECS: f64 = 1.0;
 /// How often to reconcile pane command identity outside PaneUpdate. Session
 /// switches can leave the plugin rendering before a fresh command event arrives.
 const AGENT_COMMAND_SYNC_SECS: f64 = 1.0;
+/// A retry notification stays long enough to read but never requires input.
+const REMOTE_NOTIFICATION_SECS: f64 = 6.0;
+const NOTIFICATION_MODE_KEY: &str = "flock_remote_notification";
+const NOTIFICATION_TITLE_KEY: &str = "flock_remote_notification_title";
+const NOTIFICATION_DETAIL_KEY: &str = "flock_remote_notification_detail";
+const NOTIFICATION_PERSISTENT_KEY: &str = "flock_remote_notification_persistent";
 
 /// Pipe message name (sent by a name-only `MessagePlugin` keybind, e.g. Alt b)
 /// that flips the dock between its rail and its expanded width. We only relay it
@@ -97,6 +103,17 @@ const HIDDEN_SESSION_NAME: &str = "flock-selector";
 
 #[derive(Default)]
 struct State {
+    /// Original plugin configuration, forwarded when we launch the same wasm as
+    /// a short-lived floating notification instance.
+    plugin_configuration: BTreeMap<String, String>,
+    /// This instance is a top-right notification rather than the dock.
+    is_notification: bool,
+    notification_title: String,
+    notification_detail: String,
+    notification_persistent: bool,
+    /// Deduplicates repeated health polls while still allowing an existing toast
+    /// to be updated when an incident changes severity.
+    remote_notification_kind: Option<ui::RemoteIssueKind>,
     /// Whether our permission request has been granted yet. Until it is, we
     /// can't read pane contents / application state, so we render a hint.
     permissions_granted: bool,
@@ -185,6 +202,26 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.plugin_configuration = configuration.clone();
+        self.is_notification = configuration
+            .get(NOTIFICATION_MODE_KEY)
+            .is_some_and(|value| value == "true");
+        if self.is_notification {
+            self.notification_title = configuration
+                .get(NOTIFICATION_TITLE_KEY)
+                .cloned()
+                .unwrap_or_else(|| "Remote connection problem".to_owned());
+            self.notification_detail = configuration
+                .get(NOTIFICATION_DETAIL_KEY)
+                .cloned()
+                .unwrap_or_else(|| "Connection failed".to_owned());
+            self.notification_persistent = configuration
+                .get(NOTIFICATION_PERSISTENT_KEY)
+                .is_some_and(|value| value == "true");
+            set_selectable(false);
+            subscribe(&[EventType::ModeUpdate, EventType::Mouse, EventType::Timer]);
+            return;
+        }
         self.sessionizer = SessionizerConfig::from_args(&configuration);
         // Exclude the sidebar from focus navigation, like zellij's own tab-bar /
         // status-bar: Ctrl-h/l skip over it instead of landing on it, and it's a
@@ -199,12 +236,14 @@ impl ZellijPlugin for State {
         //   resize our pane, and publish cross-session sidebar state
         // - ReadCliPipes: agent hook reports via `zellij pipe` (Phase 5)
         // - RunCommands: `flock remote-agent remote-upgrade` from a remote-issue row
+        // - MessageAndLaunchOtherPlugins: launch our non-focus-stealing toast instance
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ReadPaneContents,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
             PermissionType::RunCommands,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
 
         subscribe(&[
@@ -235,6 +274,9 @@ impl ZellijPlugin for State {
     }
 
     fn update(&mut self, event: Event) -> bool {
+        if self.is_notification {
+            return self.update_notification(event);
+        }
         let mut should_render = false;
         match event {
             Event::PermissionRequestResult(result) => {
@@ -272,6 +314,7 @@ impl ZellijPlugin for State {
             Event::SessionUpdate(sessions, _resurrectable) => {
                 self.sessions = sessions;
                 self.sync_dock_mode_from_sessions();
+                self.sync_remote_notification();
                 should_render = true;
             },
             Event::CommandChanged(pane_id, command, is_foreground, _focused_clients) => {
@@ -395,6 +438,22 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        if self.is_notification && pipe_message.name == "flock-remote-notification" {
+            if let Some(title) = pipe_message.args.get(NOTIFICATION_TITLE_KEY) {
+                self.notification_title = title.clone();
+            }
+            if let Some(detail) = pipe_message.args.get(NOTIFICATION_DETAIL_KEY) {
+                self.notification_detail = detail.clone();
+            }
+            self.notification_persistent = pipe_message
+                .args
+                .get(NOTIFICATION_PERSISTENT_KEY)
+                .is_some_and(|value| value == "true");
+            if !self.notification_persistent {
+                set_timeout(REMOTE_NOTIFICATION_SECS);
+            }
+            return true;
+        }
         // The dock-toggle channel: a name-only `MessagePlugin` keybind, broadcast to
         // every plugin, so it can never load a plugin and therefore can never
         // conjure a second sidebar pane the way a plugin-URL pipe could.
@@ -426,6 +485,10 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
+        if self.is_notification {
+            self.render_notification(cols);
+            return;
+        }
         self.rows = rows;
         self.cols = cols;
         let sessions = self.render_sessions();
@@ -456,6 +519,98 @@ impl ZellijPlugin for State {
 }
 
 impl State {
+    fn update_notification(&mut self, event: Event) -> bool {
+        match event {
+            Event::ModeUpdate(mode_info) => {
+                self.palette = Theme::from_style(&mode_info.style);
+                true
+            },
+            Event::Timer(_) if !self.notification_persistent => {
+                close_self();
+                false
+            },
+            Event::Mouse(Mouse::LeftClick(_, _)) => {
+                close_self();
+                false
+            },
+            _ => false,
+        }
+    }
+
+    fn render_notification(&self, cols: usize) {
+        let content_width = cols.saturating_sub(3);
+        let title = truncate_notification(&self.notification_title, content_width);
+        let detail = truncate_notification(&self.notification_detail, content_width);
+        let hint = if self.notification_persistent {
+            "click to dismiss · details in dock"
+        } else {
+            "details in dock"
+        };
+        print!(
+            "\x1b[2J\x1b[H{}{}⚠  {}{}\r\n{}{}{}\r\n{}{}{}",
+            fg(self.palette.red),
+            BOLD,
+            title,
+            RESET,
+            fg(self.palette.text),
+            detail,
+            RESET,
+            fg(self.palette.muted),
+            DIM,
+            truncate_notification(hint, content_width),
+        );
+    }
+
+    /// Launch one notification for a continuous incident. Session health is
+    /// refreshed once a second, so keying this to retry_count or error wording
+    /// would create a new floating pane on every poll/retry.
+    fn sync_remote_notification(&mut self) {
+        let issue = self
+            .sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .and_then(ui::session_remote_issue);
+        let Some(issue) = issue else {
+            self.remote_notification_kind = None;
+            return;
+        };
+        if self.remote_notification_kind == Some(issue.kind) {
+            return;
+        }
+        self.remote_notification_kind = Some(issue.kind);
+
+        let notification = remote_notification_content(&issue);
+        let mut configuration = self.plugin_configuration.clone();
+        configuration.insert(NOTIFICATION_MODE_KEY.to_owned(), "true".to_owned());
+        let notification_args = BTreeMap::from([
+            (NOTIFICATION_TITLE_KEY.to_owned(), notification.title),
+            (NOTIFICATION_DETAIL_KEY.to_owned(), notification.detail),
+            (
+                NOTIFICATION_PERSISTENT_KEY.to_owned(),
+                notification.persistent.to_string(),
+            ),
+        ]);
+        let coordinates = FloatingPaneCoordinates::new(
+            Some("66%".to_owned()),
+            Some("1".to_owned()),
+            Some("33%".to_owned()),
+            Some("6".to_owned()),
+            Some(true),
+            Some(false),
+        )
+        .unwrap_or_default();
+        let message = MessageToPlugin::new("flock-remote-notification")
+            .with_plugin_url("zellij:OWN_URL")
+            .with_plugin_config(configuration)
+            .with_args(notification_args)
+            .with_floating_pane_coordinates(coordinates)
+            .new_plugin_instance_should_have_pane_title("Flock remote");
+        #[cfg(target_family = "wasm")]
+        pipe_message_to_plugin(message);
+        #[cfg(not(target_family = "wasm"))]
+        let _ = message;
+    }
+
     /// Whether any agent — in this session or any other — is currently Working.
     /// Drives the faster spinner-animation cadence; the cross-session check keeps
     /// the spinner animating for working agents shown from the published bus, not
@@ -1165,6 +1320,58 @@ impl State {
     }
 }
 
+fn truncate_notification(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut result: String = text.chars().take(width).collect();
+    if text.chars().count() > width {
+        result.pop();
+        result.push('…');
+    }
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteNotificationContent {
+    title: String,
+    detail: String,
+    persistent: bool,
+}
+
+fn remote_notification_content(issue: &ui::RemoteIssue) -> RemoteNotificationContent {
+    let title = match issue.kind {
+        ui::RemoteIssueKind::Connecting => format!("Connecting {}", issue.session),
+        ui::RemoteIssueKind::Reconnecting => format!("Connection lost · {}", issue.session),
+        ui::RemoteIssueKind::Diagnostic => format!("Remote warning · {}", issue.session),
+        ui::RemoteIssueKind::VersionSkew => format!("Remote update · {}", issue.session),
+        ui::RemoteIssueKind::ProtocolIncompatible => {
+            format!("Incompatible remote · {}", issue.session)
+        },
+        ui::RemoteIssueKind::InstallFailed => {
+            format!("Remote install failed · {}", issue.session)
+        },
+    };
+    let detail = issue
+        .last_error
+        .clone()
+        .unwrap_or_else(|| match issue.kind {
+            ui::RemoteIssueKind::Connecting => "Initial connection failed; retrying".to_owned(),
+            ui::RemoteIssueKind::Reconnecting => "Connection dropped; retrying".to_owned(),
+            ui::RemoteIssueKind::Diagnostic => "The remote bridge reported a warning".to_owned(),
+            ui::RemoteIssueKind::VersionSkew => "The remote daemon uses another build".to_owned(),
+            ui::RemoteIssueKind::ProtocolIncompatible => {
+                "The remote agent must be reinstalled".to_owned()
+            },
+            ui::RemoteIssueKind::InstallFailed => "Remote agent installation failed".to_owned(),
+        });
+    RemoteNotificationContent {
+        title,
+        detail,
+        persistent: issue.kind.is_actionable(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingUpgrade {
     No,
@@ -1415,6 +1622,39 @@ fn strip_ansi_into(line: &str, out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_notifications_are_transient_and_keep_the_provider_diagnostic() {
+        let content = remote_notification_content(&ui::RemoteIssue {
+            session: "api-dev".into(),
+            kind: ui::RemoteIssueKind::Connecting,
+            daemon_version: None,
+            local_version: None,
+            pane_count: 1,
+            retry_count: 1,
+            last_error: Some("coder workspace is starting".into()),
+        });
+
+        assert_eq!(content.title, "Connecting api-dev");
+        assert_eq!(content.detail, "coder workspace is starting");
+        assert!(!content.persistent);
+    }
+
+    #[test]
+    fn actionable_remote_notifications_wait_for_dismissal() {
+        let content = remote_notification_content(&ui::RemoteIssue {
+            session: "api-dev".into(),
+            kind: ui::RemoteIssueKind::ProtocolIncompatible,
+            daemon_version: None,
+            local_version: Some("26.10.1".into()),
+            pane_count: 1,
+            retry_count: 2,
+            last_error: Some("incompatible protocol version 2".into()),
+        });
+
+        assert!(content.persistent);
+        assert!(content.title.contains("Incompatible remote"));
+    }
     use crate::detect::Agent;
 
     fn argv(args: &[&str]) -> Vec<String> {

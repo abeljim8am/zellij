@@ -2550,6 +2550,23 @@ impl SessionInfo {
         }
         self.plugins = plugin_list;
     }
+
+    /// Replace a disk-scanned current-session `dock_state` with the live mode.
+    ///
+    /// Session scans read `session-metadata.kdl`, which can lag the in-memory
+    /// dock by a full write interval. Plugins treat the current session's
+    /// `dock_state` as the CAS expected value, so a stale Closed on disk makes
+    /// a close attempt try to open an already-open dock.
+    pub fn apply_live_dock_state_to_current(
+        sessions: &mut BTreeMap<String, SessionInfo>,
+        current_session_name: &str,
+        dock_state: Option<DockState>,
+    ) {
+        if let Some(session) = sessions.get_mut(current_session_name) {
+            session.dock_state = dock_state;
+            session.is_current_session = true;
+        }
+    }
 }
 
 /// Contains all the information for a currently opened tab.
@@ -4065,4 +4082,26 @@ pub fn can_parse_unicode_bare_keys() {
         Some(BareKey::Char('ъ')),
         "Can parse a bare 'ъ' keypress"
     );
+}
+
+#[test]
+fn live_dock_state_overlays_a_stale_current_session_scan() {
+    let mut sessions = BTreeMap::new();
+    let mut scanned = SessionInfo::new("native".into());
+    scanned.dock_state = Some(DockState {
+        mode: DockMode::Closed,
+        updated_at_millis: 1,
+    });
+    sessions.insert("native".into(), scanned);
+    sessions.insert("other".into(), SessionInfo::new("other".into()));
+
+    let live = Some(DockState {
+        mode: DockMode::Open,
+        updated_at_millis: 2,
+    });
+    SessionInfo::apply_live_dock_state_to_current(&mut sessions, "native", live);
+
+    assert_eq!(sessions["native"].dock_state, live);
+    assert!(sessions["native"].is_current_session);
+    assert_eq!(sessions["other"].dock_state, None);
 }

@@ -9972,3 +9972,35 @@ fn detaching_client_grows_vacated_tab_back() {
         "Tab grows back to fit the remaining viewer after the smaller one detaches"
     );
 }
+
+#[test]
+fn session_scan_does_not_replace_live_dock_state_with_stale_disk() {
+    use std::collections::BTreeMap;
+    use zellij_utils::data::{DockMode, DockState, SessionInfo};
+
+    let size = Size { cols: 80, rows: 24 };
+    let mut screen = create_new_screen(size, true, true);
+    let live = DockState {
+        mode: DockMode::Open,
+        updated_at_millis: 2_000,
+    };
+    screen.published_dock_state = Some(live);
+
+    let mut scanned = SessionInfo::new("zellij-test".into());
+    scanned.dock_state = Some(DockState {
+        mode: DockMode::Closed,
+        updated_at_millis: 1_000,
+    });
+    let mut new_session_infos = BTreeMap::new();
+    new_session_infos.insert("zellij-test".into(), scanned);
+
+    let _ = screen.update_session_infos(new_session_infos, BTreeMap::new());
+
+    assert_eq!(
+        screen
+            .peer_sessions_cache
+            .get("zellij-test")
+            .and_then(|session| session.dock_state),
+        Some(live)
+    );
+}

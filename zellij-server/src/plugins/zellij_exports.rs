@@ -4217,19 +4217,20 @@ fn get_pane_running_command(env: &PluginEnv, pane_id: PaneId) {
 
 fn get_session_list(env: &PluginEnv) {
     use crate::background_jobs::{scan_session_list_default_dirs, session_scan_state};
-    use zellij_utils::data::{GetSessionListResponse, SessionListSnapshot};
+    use zellij_utils::data::{GetSessionListResponse, SessionInfo, SessionListSnapshot};
 
     let response = match session_scan_state() {
         Some(state) => {
-            let (session_name, available_layouts, plugin_list) = {
+            let (session_name, available_layouts, plugin_list, current_dock_state) = {
                 let name = state.current_session_name.lock().unwrap().clone();
                 let info = state.current_session_info.lock().unwrap().clone();
                 let plugins = state.current_session_plugin_list.lock().unwrap().clone();
-                (name, info.available_layouts, plugins)
+                (name, info.available_layouts, plugins, info.dock_state)
             };
+            let current_session_name = session_name.clone();
 
             let cached_scan = state.last_scan_result.lock().unwrap().clone();
-            let (live_sessions_map, resurrectable_sessions_map) = match cached_scan {
+            let (mut live_sessions_map, resurrectable_sessions_map) = match cached_scan {
                 Some(last_scan) => {
                     // serve the last scan immediately and refresh it
                     // off-thread: the scan's socket liveness handshakes can
@@ -4285,6 +4286,11 @@ fn get_session_list(env: &PluginEnv) {
                     scan
                 },
             };
+            SessionInfo::apply_live_dock_state_to_current(
+                &mut live_sessions_map,
+                &current_session_name,
+                current_dock_state,
+            );
 
             let snapshot = SessionListSnapshot {
                 live_sessions: live_sessions_map.into_values().collect(),

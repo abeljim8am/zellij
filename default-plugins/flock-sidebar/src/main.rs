@@ -458,7 +458,9 @@ impl ZellijPlugin for State {
         // every plugin, so it can never load a plugin and therefore can never
         // conjure a second sidebar pane the way a plugin-URL pipe could.
         if pipe_message.name == DOCK_TOGGLE_PIPE {
-            self.toggle_dock();
+            if !self.is_notification {
+                self.toggle_dock();
+            }
             return false; // the server's resize triggers our re-render
         }
         if pipe_message.name == CLOSE_CURRENT_SESSION_PIPE {
@@ -516,6 +518,13 @@ impl ZellijPlugin for State {
         self.click_map = output.click_map;
         print!("{}", output.ansi);
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl State {
@@ -853,9 +862,13 @@ impl State {
     fn toggle_dock(&mut self) {
         // Pass the mode we believe is current so the server can compare-and-swap.
         // A dock exists per tab, so this broadcast reaches every instance; only the
-        // one whose view is still accurate should flip it.
+        // one whose view is still accurate should flip it. Update the local cache
+        // immediately so a stale 1s disk scan cannot make the next press try to
+        // open an already-open dock.
         let current = self.sidebar_mode;
-        set_dock_mode(current.toggled().into(), Some(current.into()));
+        self.sidebar_mode = current.toggled();
+        self.sidebar_state_updated_at_millis = now_millis();
+        set_dock_mode(self.sidebar_mode.into(), Some(current.into()));
     }
 
     /// Track the server's dock mode, and adopt a newer one from another session.
@@ -872,11 +885,15 @@ impl State {
             .find(|session| session.is_current_session)
             .and_then(|session| session.dock_state)
         {
-            self.sidebar_state_updated_at_millis = own.updated_at_millis;
-            let own_mode = SidebarMode::from(own.mode);
-            if own_mode != self.sidebar_mode {
-                self.sidebar_mode = own_mode;
-                should_render = true;
+            // Disk-backed scans can lag the live mode. Ignore an older own
+            // dock_state so it cannot rewind a toggle we already applied.
+            if own.updated_at_millis >= self.sidebar_state_updated_at_millis {
+                self.sidebar_state_updated_at_millis = own.updated_at_millis;
+                let own_mode = SidebarMode::from(own.mode);
+                if own_mode != self.sidebar_mode {
+                    self.sidebar_mode = own_mode;
+                    should_render = true;
+                }
             }
         }
         let Some(newest) = self
@@ -2361,5 +2378,45 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn stale_own_dock_state_does_not_rewind_a_local_toggle() {
+        let mut current = SessionInfo::new("native".to_string());
+        current.is_current_session = true;
+        current.dock_state = Some(DockState {
+            mode: DockMode::Closed,
+            updated_at_millis: 1_000,
+        });
+        let mut state = State {
+            sessions: vec![current],
+            sidebar_mode: SidebarMode::Open,
+            sidebar_state_updated_at_millis: 2_000,
+            ..State::default()
+        };
+
+        assert!(!state.sync_dock_mode_from_sessions());
+        assert_eq!(state.sidebar_mode, SidebarMode::Open);
+        assert_eq!(state.sidebar_state_updated_at_millis, 2_000);
+    }
+
+    #[test]
+    fn newer_own_dock_state_updates_local_mode() {
+        let mut current = SessionInfo::new("native".to_string());
+        current.is_current_session = true;
+        current.dock_state = Some(DockState {
+            mode: DockMode::Closed,
+            updated_at_millis: 2_000,
+        });
+        let mut state = State {
+            sessions: vec![current],
+            sidebar_mode: SidebarMode::Open,
+            sidebar_state_updated_at_millis: 1_000,
+            ..State::default()
+        };
+
+        assert!(state.sync_dock_mode_from_sessions());
+        assert_eq!(state.sidebar_mode, SidebarMode::Closed);
+        assert_eq!(state.sidebar_state_updated_at_millis, 2_000);
     }
 }

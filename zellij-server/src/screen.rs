@@ -3799,6 +3799,11 @@ impl Screen {
         resurrectable_sessions: BTreeMap<String, Duration>,
     ) -> Result<()> {
         self.peer_sessions_cache = new_session_infos;
+        SessionInfo::apply_live_dock_state_to_current(
+            &mut self.peer_sessions_cache,
+            &self.session_name,
+            self.published_dock_state,
+        );
         self.resurrectable_sessions_cache = resurrectable_sessions;
         self.bus
             .senders
